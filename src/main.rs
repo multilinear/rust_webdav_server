@@ -1,3 +1,19 @@
+/// This is an async WebDAV server.
+/// 
+/// Design decisions:
+/// Right now we allow simple stand-alone filesystem stat calls 
+///   "exists()" "is_dir()" "is_file()"
+/// to be performed synchronously. All other filesystem and network operations
+/// are considered "long-lived" and performed asynchronously.
+/// Making these operations in to futures significantly complicates the server
+/// so it was decided to leave it until proven necessary. 
+
+// TODO: Error codes are all wrong... like really all wrong
+// TODO: PROPFIND, GET, HEAD
+// TODO: Locks
+// TODO: CarDAV CalDAV
+
+
 extern crate hyper;
 extern crate pretty_env_logger;
 extern crate futures;
@@ -13,17 +29,57 @@ use std::io::Write;
 use tokio::fs::file;
 use futures::*;
 
+// Maximum alloweable webdav object size
 const MAX_FILE_SIZE: u64 = 102400;
 
 type BoxFut = Box<Future<Item=Response<Body>, Error=hyper::webdav::Error> + Send>;
 
-fn error_response(statuscode: StatusCode) -> webdav::Result<Response<Body>> {
-		Response::builder().status(statuscode).body(Body::empty())
+// ********* Filesystem helper methods
+
+/// Recursively deletes files and directories (not symlinks)
+// TODO: Make it not stop on IO Error
+fn recursive_delete(path: PathBuf) -> Box<Future<Item=(), Error=std::io::Error> + Send> {
+  if path.is_dir() {
+    Box::new(tokio::fs::read_dir(path.clone())
+      .and_then(|s| s.for_each(|d| 
+        recursive_delete(d.path())))
+      .and_then(|_| tokio::fs::remove_dir(path))
+    )
+  } else {
+    Box::new(tokio::fs::remove_file(path))
+  }
 }
 
-fn get_serve_root() -> PathBuf {
-	Path::new("/home/mbrewer/webdav_root").canonicalize().unwrap()
+/// Recursively copy a src to dest (src=/foo/bar dest=/foo/baz copies bar to baz)
+// TODO: Make it not stop on IO Error
+fn recursive_copy(src: PathBuf, dest: PathBuf, depth: Option<u32>) -> Box<Future<Item=(), Error=std::io::Error> + Send> {
+  fn recursive_copy_helper(src: PathBuf, dest: PathBuf, depth: Option<u32>) -> Box<Future<Item=(), Error=std::io::Error> + Send> {
+    if depth == Some(0) {
+      return Box::new(done(Ok(())));
+    };
+    if src.is_dir() {
+      return Box::new(tokio::fs::create_dir(dest.clone())
+        .and_then(|_| tokio::fs::read_dir(src))
+        .and_then(move |s| s.for_each(move |d| 
+          recursive_copy(d.path(), 
+            Path::join(dest.as_path(), d.path().file_name().unwrap()),
+            depth.map(|d| d-1))))
+      );
+    } else {
+      return Box::new(tokio::fs::File::create(dest)
+        .and_then(|mut dest_f| tokio::fs::File::open(src)
+          .and_then(move |src_f|
+            tokio::codec::FramedRead::new(src_f, tokio::codec::BytesCodec::new()).for_each(move |c| dest_f.write_all(&c))
+          )
+        )
+      );
+    }
+  };
+  // We want depth=0 to mean delete the top level
+  recursive_copy_helper(src, dest, depth.map(|d| d+1))
 }
+
+// ********** Path verification helper methods
 
 /// Checks that a path is in the serving path, and not doing dumb things
 /// Doesn't check existence, since we may want to create it
@@ -41,31 +97,19 @@ fn is_valid_path(p: &Path) -> bool {
   return true;
 }
 
-/*/// Checks that the parent is in the serving path, valid, and exists
-fn has_valid_parent(p: &Path) -> bool {
-  let parent = match p.parent() {
-    None => return false,
-    Some(p) => p,
-  };
-  is_valid_path(parent) && parent.is_dir()
-}
-*/
-
 /// Computes a file path from a URI, returns "None" if it's not a valid
 fn path_from_uri(uri_path_str: &str) -> Option<PathBuf> {
-	let uri_path = Path::new(uri_path_str);	
-	uri_path.strip_prefix(Path::new(&"/"))
-		.map(|path| Path::join(get_serve_root().as_path(), path))
-		.ok()
-		// Now do security checks
-    .and_then(|p| if is_valid_path(&p) {Some(p)} else {None})
+  // By spec uri might or might not end with "/" when referring to collections
+  let uri = uri_path_str.trim_matches('/');
+	let path = Path::join(get_serve_root().as_path(), uri);
+  // Now do security checks
+  if is_valid_path(&path) {Some(path)} else {None}
 }
 
 /// Computes file path of parent, returns "None" if it's not a valid 
 /// or doesn't exist
 fn parent_from_path(path: &Path) -> Option<PathBuf> {
   path.parent().and_then(|p|
-    // Arguably "is_dir()" should be contained in a future
     if is_valid_path(p) && p.is_dir() {
       Some(p.to_owned())
     } else {
@@ -74,34 +118,50 @@ fn parent_from_path(path: &Path) -> Option<PathBuf> {
   )
 }
 
-/* /// computes a collection metadata file from the path to the collection itself
-fn collection_from_path(path: &Path) -> PathBuf {
-	// pre:
-	//   we checked file is safe (in the serving dir)
-  //   we checked the parent is safe (in the serving dir)
-	// TODO: Make sure to use a dav-disallowed charactor for ":"
-	Path::join(path.parent().unwrap(), String::new() + "C:" + path.file_name().unwrap().to_str().unwrap())
-}*/
+// ********* Server helper methods
+
+fn error_response(statuscode: StatusCode) -> webdav::Result<Response<Body>> {
+		Response::builder().status(statuscode).body(Body::empty())
+}
+
+fn get_serve_root() -> PathBuf {
+	Path::new("/home/mbrewer/webdav_root").canonicalize().unwrap()
+}
+
+/// Get the "depth" header (if it exists).
+/// None is infinity, and also the default.
+fn get_depth_header<T>(req: &Request<T>) -> Option<u32> {
+  req.headers().get("depth").and_then(|v| v.to_str().ok())
+    .and_then(|s| if s == "infinity" {None} else {s.parse().ok()})
+}
+
+fn get_dest_header<T>(req: &Request<T>) -> Option<PathBuf> {
+  req.headers().get("Destination")
+    .and_then(|v| v.to_str().ok())
+    .and_then(|s| path_from_uri(s))
+}
+
+fn get_src_header<T>(req: &Request<T>) -> Option<PathBuf> {
+  path_from_uri(req.uri().path())
+}
+
+
+// ************ Main server code
 
 /// Process put requests
 fn process_put(req: Request<Body>) -> BoxFut {
-  let path = match path_from_uri(req.uri().path()) {
+  let path = match get_src_header(&req) {
     None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
     Some(p) => p,
   };
+  if path.is_dir() {
+    return Box::new(done(error_response(StatusCode::METHOD_NOT_ALLOWED)));
+  }
   match parent_from_path(&path) {
     None => return Box::new(done(error_response(StatusCode::CONFLICT))), 
     Some(p) => p,
   }; 
 
-  // At this point "parent" contains all the right errors
-  // Next we start with parent, then use path (which if invoked has no errors)
-  // This lets us operate on path, while propogating errors properly.
-
-  // Create the file (truncate if exists), and write the stream to it.
-  // This is fully async (create, and write_all are both futures).
-  //   for_each will wait for new data on the stream, and create a few write_all
-  //   future. Write_all will yield () when it completes handing back to for_each.
   // TODO: We should check for valid XML
   Box::new(file::File::create(path).map_err(|_| StatusCode::NOT_FOUND)
     .and_then(move |mut f| 
@@ -109,33 +169,48 @@ fn process_put(req: Request<Body>) -> BoxFut {
         f.write_all(&chunk).map(|_| ()).map_err(hyper::Error::new_io)
       ).map_err(|_| StatusCode::NOT_FOUND)
     )
-  // Remap success to a 200 response
     .map(|_| Response::new(Body::from("")))
-  // Remap errors to an Ok result containing a response with the status code
-  // done() does "Ok(Response)) -> ok(Response)"
     .or_else(|status| done(error_response(status)))
+    .from_err()
+  )
+}
+
+/// Process Delete requests
+// TODO: must return compound response (Errors encoded in XML)
+fn process_delete(req: Request<Body>) -> BoxFut {
+	let path =  match get_src_header(&req) {
+    None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
+    Some(p) => p,
+  };
+  if !path.exists() {
+    return Box::new(done(error_response(StatusCode::NOT_FOUND)));
+  }
+  Box::new(recursive_delete(path)
+    .map(|_| {let mut r = Response::new(Body::from("")); *r.status_mut() = StatusCode::NO_CONTENT; r})
+    .or_else(|_| done(error_response(StatusCode::NOT_FOUND)))
     .from_err()
   )
 }
 
 /// Process mkcol (webdav extension) requests
 fn process_mkcol(req: Request<Body>) -> BoxFut {
-  let path = match path_from_uri(req.uri().path()) {
+  // Gather and verify arguments
+  let path = match get_src_header(&req) {
     None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
     Some(p) => p,
   };
-  // Check the parent exists
-  // Unless you run it against "/" (don't do that) parent will exist
+
+  // Check
   if !is_valid_path(path.parent().unwrap()) {
-    return Box::new(done(error_response(StatusCode::CONFLICT))); 
+    return Box::new(done(error_response(StatusCode::NOT_FOUND))); 
   }; 
-  // Check our entity doesn't exist yet 
   if path.exists() {
     return Box::new(done(error_response(StatusCode::CONFLICT))); 
   };
-  //let collection = collection_from_path(&path); 
   // We don't bother checking if the collection file exists
   // This would just be corruption and we'll just truncate it
+
+  // Create
   Box::new(tokio::fs::create_dir(path).map_err(|_| StatusCode::NOT_FOUND)
 		.and_then(|_| req.into_body().take(1).collect().map_err(|_| StatusCode::NOT_FOUND)
 		// webdav doesn't define what MKCOL body would do, so we error if we get one
@@ -145,23 +220,62 @@ fn process_mkcol(req: Request<Body>) -> BoxFut {
 			} else {
 				Err(StatusCode::NOT_FOUND)
 			}))
-		/*.and_then(move |_|
-			file::File::create(collection).map_err(|_| StatusCode::NOT_FOUND))
-    .and_then(move |mut f|
-      req.into_body().take(MAX_FILE_SIZE).for_each(move |chunk|
-        f.write_all(&chunk).map(|_| ()).map_err(hyper::Error::new_io)
-      ).map_err(|_| StatusCode::NOT_FOUND)
-    )*/
-  // Remap success to a 200 response
     .map(|_| Response::new(Body::from("")))
-  // Remap errors to an Ok result containing a response with the status code
-  // done() does "Ok(Response)) -> ok(Response)"
     .or_else(|status| done(error_response(status)))
     .from_err()
   )
-
 }
 
+/// Process copy (webdav extension) requests
+fn process_copy(req: Request<Body>) -> BoxFut {
+  // gather and verify arguments
+  let src = match path_from_uri(req.uri().path()) {
+    None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
+    Some(p) => p,
+  };
+  let dest = match get_dest_header(&req) {
+    None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
+    Some(s) => s, 
+  };
+  let depth = get_depth_header(&req);
+
+  // check
+  if !src.exists() {
+    return Box::new(done(error_response(StatusCode::NOT_FOUND)));
+  }
+
+  // and copy
+  Box::new(recursive_copy(src, dest, depth)
+    .map(|_| {let mut r = Response::new(Body::from("")); *r.status_mut() = StatusCode::NO_CONTENT; r})
+    .or_else(|_| done(error_response(StatusCode::NOT_FOUND)))
+    .from_err()
+  )
+}
+
+/// Process move (webdav extension) requests
+fn process_move(req: Request<Body>) -> BoxFut {
+  // Verify paths
+  let src = match path_from_uri(req.uri().path()) {
+    None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
+    Some(p) => p,
+  };
+  if !src.exists() {
+    return Box::new(done(error_response(StatusCode::NOT_FOUND)));
+  }
+  // Read our headers
+  let dest = match get_dest_header(&req) {
+    None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
+    Some(s) => s, 
+  };
+  // TODO: this could probably be "rename"?  
+  Box::new(recursive_copy(src.clone(), dest, None).and_then(|_| recursive_delete(src))
+    .map(|_| {let mut r = Response::new(Body::from("")); *r.status_mut() = StatusCode::NO_CONTENT; r})
+    .or_else(|_| done(error_response(StatusCode::NOT_FOUND)))
+    .from_err()
+  )
+}
+
+/// Process unknown requests
 fn process_default(_req: Request<Body>) -> BoxFut {
   Box::new(done(error_response(StatusCode::NOT_FOUND)))
 }
@@ -171,13 +285,16 @@ fn process_requests(req: Request<Body>) -> BoxFut {
 	match *req.method() {
 		//Method::OPTIONS => process_default(req),
 		//Method::GET => process_default(req),
+		//Method::HEAD => process_default(req),
+		//Method::POST => process_default(req),
 		Method::PUT => process_put(req),
-		//Method::DELETE => process_default(req),
+		Method::DELETE => process_delete(req),
 		_ => match req.method().as_str() {
 			"MKCOL" => process_mkcol(req),
+			"MOVE" => process_move(req),
+			"COPY" => process_copy(req),
 			//"PROPFIND" => process_default(req),
-			//"MOVE" => process_default(req),
-			//"COPY" => process_default(req),
+			//"PROPPATCH" => process_default(req),
 			_ => process_default(req),
 		}
 	}
