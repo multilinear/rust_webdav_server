@@ -250,9 +250,13 @@ fn process_copy(req: Request<Body>) -> BoxFut {
   };
   let depth = get_depth_header(&req);
   let overwrite = get_overwrite_header(&req);
-
+  let dest_exists = dest.exists();
+ 
   // check
   if !src.exists() {
+    return Box::new(done(error_response(StatusCode::NOT_FOUND)));
+  }
+  if dest_exists && !overwrite {
     return Box::new(done(error_response(StatusCode::NOT_FOUND)));
   }
 
@@ -270,26 +274,31 @@ fn process_copy(req: Request<Body>) -> BoxFut {
 
 /// Process move (webdav extension) requests
 fn process_move(req: Request<Body>) -> BoxFut {
-  // Verify paths
+  // gather and verify arguments
   let src = match path_from_uri(req.uri().path()) {
     None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
     Some(p) => p,
   };
-  if !src.exists() {
-    return Box::new(done(error_response(StatusCode::NOT_FOUND)));
-  }
-  // Read our headers
   let dest = match get_dest_header(&req) {
     None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
     Some(s) => s, 
   };
   let overwrite = get_overwrite_header(&req);
-  
+  let dest_exists = dest.exists();
+
+  // check
+  if !src.exists() {
+    return Box::new(done(error_response(StatusCode::NOT_FOUND)));
+  }
+  if dest_exists && !overwrite {
+    return Box::new(done(error_response(StatusCode::NOT_FOUND)));
+  }
+
   let dest2 = dest.clone();
   let src2 = src.clone();
   // TODO: this could probably be "rename"?  
-  Box::new(done(Ok(overwrite))
-    .and_then(move |o| if o {recursive_delete(dest)} else {Box::new(done(Ok(())))})
+  Box::new(done(Ok(dest_exists))
+    .and_then(move |e| if e {recursive_delete(dest)} else {Box::new(done(Ok(())))})
     .or_else(|_| Ok(()))
     .and_then(move |_| recursive_copy(src, dest2, None))
     .and_then(move |_| recursive_delete(src2))
