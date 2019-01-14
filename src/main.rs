@@ -143,6 +143,14 @@ fn get_dest_header<T>(req: &Request<T>) -> Option<PathBuf> {
     .and_then(|s| path_from_uri(s))
 }
 
+/// Get "overwrite" header (if it exists).
+fn get_overwrite_header<T>(req: &Request<T>) -> bool {
+  match req.headers().get("Overwrite").and_then(|v| v.to_str().ok()) {
+    Some("F") => false,
+    _ => true,
+  }
+}
+
 /// Get "src" header (if it exists).
 /// Actually gets it from the URI, just named header for consistancy.
 fn get_src_header<T>(req: &Request<T>) -> Option<PathBuf> {
@@ -241,14 +249,19 @@ fn process_copy(req: Request<Body>) -> BoxFut {
     Some(s) => s, 
   };
   let depth = get_depth_header(&req);
+  let overwrite = get_overwrite_header(&req);
 
   // check
   if !src.exists() {
     return Box::new(done(error_response(StatusCode::NOT_FOUND)));
   }
 
+  let dest2 = dest.clone();
   // and copy
-  Box::new(recursive_copy(src, dest, depth)
+  Box::new(done(Ok(overwrite))
+    .and_then(move |o| if o {recursive_delete(dest)} else {Box::new(done(Ok(())))})
+    .or_else(|_| Ok(()))
+    .and_then(move |_| recursive_copy(src, dest2, depth))
     .map(|_| {let mut r = Response::new(Body::from("")); *r.status_mut() = StatusCode::NO_CONTENT; r})
     .or_else(|_| done(error_response(StatusCode::NOT_FOUND)))
     .from_err()
@@ -270,8 +283,16 @@ fn process_move(req: Request<Body>) -> BoxFut {
     None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
     Some(s) => s, 
   };
+  let overwrite = get_overwrite_header(&req);
+  
+  let dest2 = dest.clone();
+  let src2 = src.clone();
   // TODO: this could probably be "rename"?  
-  Box::new(recursive_copy(src.clone(), dest, None).and_then(|_| recursive_delete(src))
+  Box::new(done(Ok(overwrite))
+    .and_then(move |o| if o {recursive_delete(dest)} else {Box::new(done(Ok(())))})
+    .or_else(|_| Ok(()))
+    .and_then(move |_| recursive_copy(src, dest2, None))
+    .and_then(move |_| recursive_delete(src2))
     .map(|_| {let mut r = Response::new(Body::from("")); *r.status_mut() = StatusCode::NO_CONTENT; r})
     .or_else(|_| done(error_response(StatusCode::NOT_FOUND)))
     .from_err()
