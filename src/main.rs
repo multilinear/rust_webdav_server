@@ -23,7 +23,7 @@ extern crate tokio_fs;
 use hyper::{Body, Request, Response, Server};
 use hyper::service::service_fn;
 use hyper::rt::{self, Future};
-use webdav::{Method, StatusCode};
+use http::{Method, StatusCode};
 use std::path::{Path, PathBuf};
 use std::io::Write;
 use tokio::fs::file;
@@ -32,7 +32,7 @@ use futures::*;
 // Maximum alloweable webdav object size
 const MAX_FILE_SIZE: u64 = 102400;
 
-type BoxFut = Box<Future<Item=Response<Body>, Error=hyper::webdav::Error> + Send>;
+type BoxFut = Box<Future<Item=Response<Body>, Error=hyper::http::Error> + Send>;
 
 // ********* Filesystem helper methods
 
@@ -69,7 +69,8 @@ fn recursive_copy(src: PathBuf, dest: PathBuf, depth: Option<u32>) -> Box<Future
       return Box::new(tokio::fs::File::create(dest)
         .and_then(|mut dest_f| tokio::fs::File::open(src)
           .and_then(move |src_f|
-            tokio::codec::FramedRead::new(src_f, tokio::codec::BytesCodec::new()).for_each(move |c| dest_f.write_all(&c))
+            tokio::codec::FramedRead::new(src_f, tokio::codec::BytesCodec::new())
+              .for_each(move |c| dest_f.write_all(&c))
           )
         )
       );
@@ -120,8 +121,8 @@ fn parent_from_path(path: &Path) -> Option<PathBuf> {
 
 // ********* Server helper methods
 
-fn error_response(statuscode: StatusCode) -> webdav::Result<Response<Body>> {
-		Response::builder().status(statuscode).body(Body::empty())
+fn error_response(statuscode: StatusCode) -> http::Result<Response<Body>> {
+  Response::builder().status(statuscode).body(Body::empty())
 }
 
 fn get_serve_root() -> PathBuf {
@@ -135,16 +136,18 @@ fn get_depth_header<T>(req: &Request<T>) -> Option<u32> {
     .and_then(|s| if s == "infinity" {None} else {s.parse().ok()})
 }
 
+/// Get "destination" header (if it exists).
 fn get_dest_header<T>(req: &Request<T>) -> Option<PathBuf> {
   req.headers().get("Destination")
     .and_then(|v| v.to_str().ok())
     .and_then(|s| path_from_uri(s))
 }
 
+/// Get "src" header (if it exists).
+/// Actually gets it from the URI, just named header for consistancy.
 fn get_src_header<T>(req: &Request<T>) -> Option<PathBuf> {
   path_from_uri(req.uri().path())
 }
-
 
 // ************ Main server code
 
@@ -165,8 +168,8 @@ fn process_put(req: Request<Body>) -> BoxFut {
   // TODO: We should check for valid XML
   Box::new(file::File::create(path).map_err(|_| StatusCode::NOT_FOUND)
     .and_then(move |mut f| 
-      req.into_body().take(MAX_FILE_SIZE).for_each(move |chunk| 
-        f.write_all(&chunk).map(|_| ()).map_err(hyper::Error::new_io)
+      req.into_body().take(MAX_FILE_SIZE).map_err(|_| ()).for_each(move |chunk|
+        f.write_all(&chunk).map(|_| ()).map_err(|_| ())
       ).map_err(|_| StatusCode::NOT_FOUND)
     )
     .map(|_| Response::new(Body::from("")))
@@ -281,7 +284,7 @@ fn process_default(_req: Request<Body>) -> BoxFut {
 }
 
 fn process_requests(req: Request<Body>) -> BoxFut {
-//webdav::Result<Response<Body>> {
+//http::Result<Response<Body>> {
 	match *req.method() {
 		//Method::OPTIONS => process_default(req),
 		//Method::GET => process_default(req),
@@ -301,13 +304,13 @@ fn process_requests(req: Request<Body>) -> BoxFut {
 }
 
 fn main() {
-    pretty_env_logger::init();
-    let addr = ([127, 0, 0, 1], 3000).into();
-    let server = Server::bind(&addr)
-        .serve(|| service_fn(process_requests))
-        .map_err(|e| eprintln!("server error: {}", e));
+  pretty_env_logger::init();
+  let addr = ([127, 0, 0, 1], 3000).into();
+  let server = Server::bind(&addr)
+    .serve(|| service_fn(process_requests))
+    .map_err(|e| eprintln!("server error: {}", e));
 
-    println!("Listening on http://{}", addr);
+  println!("Listening on http://{}", addr);
 
-    rt::run(server);
+  rt::run(server);
 }
