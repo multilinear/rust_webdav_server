@@ -159,6 +159,27 @@ fn get_src_header<T>(req: &Request<T>) -> Option<PathBuf> {
 
 // ************ Main server code
 
+/// Process get requests
+fn process_get(req: Request<Body>) -> BoxFut {
+  let path = match get_src_header(&req) {
+    None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
+    Some(p) => p,
+  };
+  if path.is_dir() {
+    return Box::new(done(error_response(StatusCode::METHOD_NOT_ALLOWED)));
+  }
+
+  // TODO: We should check for valid XML?
+  Box::new(tokio::fs::File::open(path)
+    .and_then(|src_f| futures::future::ok(Response::new(Body::wrap_stream(
+      tokio::codec::FramedRead::new(src_f, tokio::codec::BytesCodec::new())
+        .map(|b| b.freeze())
+    ))))
+    .or_else(|_| done(error_response(StatusCode::NOT_FOUND)))
+    .from_err()
+  )
+}
+
 /// Process put requests
 fn process_put(req: Request<Body>) -> BoxFut {
   let path = match get_src_header(&req) {
@@ -173,14 +194,14 @@ fn process_put(req: Request<Body>) -> BoxFut {
     Some(p) => p,
   }; 
 
-  // TODO: We should check for valid XML
+  // TODO: We should check for valid XML?
   Box::new(file::File::create(path).map_err(|_| StatusCode::NOT_FOUND)
     .and_then(move |mut f| 
       req.into_body().take(MAX_FILE_SIZE).map_err(|_| ()).for_each(move |chunk|
         f.write_all(&chunk).map(|_| ()).map_err(|_| ())
       ).map_err(|_| StatusCode::NOT_FOUND)
     )
-    .map(|_| Response::new(Body::from("")))
+    .map(|_| Response::new(Body::from(Body::empty())))
     .or_else(|status| done(error_response(status)))
     .from_err()
   )
@@ -317,7 +338,7 @@ fn process_requests(req: Request<Body>) -> BoxFut {
 //http::Result<Response<Body>> {
 	match *req.method() {
 		//Method::OPTIONS => process_default(req),
-		//Method::GET => process_default(req),
+		Method::GET => process_get(req),
 		//Method::HEAD => process_default(req),
 		//Method::POST => process_default(req),
 		Method::PUT => process_put(req),
