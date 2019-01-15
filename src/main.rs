@@ -9,8 +9,8 @@
 /// so it was decided to leave it until proven necessary. 
 
 // TODO: Error codes are all wrong... like really all wrong
-// TODO: PROPFIND, GET, HEAD
-// TODO: Locks
+// TODO: PROPFIND, PROPPATCH
+// TODO: Locks (don't forget to add compat 2,3 to OPTION resonse)
 // TODO: CarDAV CalDAV
 
 
@@ -23,11 +23,13 @@ extern crate tokio_fs;
 use hyper::{Body, Request, Response, Server};
 use hyper::service::service_fn;
 use hyper::rt::{self, Future};
+use hyper::header::HeaderValue;
 use http::{Method, StatusCode};
 use std::path::{Path, PathBuf};
 use std::io::Write;
 use tokio::fs::file;
 use futures::*;
+use futures::future::{ok};
 
 // Maximum alloweable webdav object size
 const MAX_FILE_SIZE: u64 = 102400;
@@ -159,6 +161,36 @@ fn get_src_header<T>(req: &Request<T>) -> Option<PathBuf> {
 
 // ************ Main server code
 
+/// Process options requests
+fn process_options(req: Request<Body>) -> BoxFut {
+  let path = match get_src_header(&req) {
+    None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
+    Some(p) => p,
+  };
+  if req.uri().path() != "*" && !path.exists() {
+    return Box::new(done(error_response(StatusCode::NOT_FOUND)));
+  }
+  let mut r = Response::new(Body::empty());
+  let h = r.headers_mut();
+  h.insert("DAV", HeaderValue::from_str("1").unwrap());
+  h.insert("Allow", HeaderValue::from_str(
+    "OPTIONS,GET,HEAD,PUT,DELETE,MKCOL,MOVE,COPY,PROPFIND,PROPPATCH")
+    .unwrap());
+  Box::new(ok(r))
+}
+
+/// Process head requests
+fn process_head(req: Request<Body>) -> BoxFut {
+  let path = match get_src_header(&req) {
+    None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
+    Some(p) => p,
+  };
+  if !path.is_file() && !path.is_dir() {
+    return Box::new(done(error_response(StatusCode::NOT_FOUND)));
+  }
+  return Box::new(ok(Response::new(Body::empty())));
+}
+
 /// Process get requests
 fn process_get(req: Request<Body>) -> BoxFut {
   let path = match get_src_header(&req) {
@@ -166,12 +198,14 @@ fn process_get(req: Request<Body>) -> BoxFut {
     Some(p) => p,
   };
   if path.is_dir() {
-    return Box::new(done(error_response(StatusCode::METHOD_NOT_ALLOWED)));
+    // Just return empty.
+    // If we allowed MKCOL to write data out, we'd read it here I guess?
+    return Box::new(ok(Response::new(Body::empty())));
   }
 
   // TODO: We should check for valid XML?
   Box::new(tokio::fs::File::open(path)
-    .and_then(|src_f| futures::future::ok(Response::new(Body::wrap_stream(
+    .and_then(|src_f| ok(Response::new(Body::wrap_stream(
       tokio::codec::FramedRead::new(src_f, tokio::codec::BytesCodec::new())
         .map(|b| b.freeze())
     ))))
@@ -329,6 +363,14 @@ fn process_move(req: Request<Body>) -> BoxFut {
   )
 }
 
+/// Process profind requests
+fn process_propfind(req: Request<Body>) -> BoxFut {
+  let src = match path_from_uri(req.uri().path()) {
+    None => return Box::new(done(error_response(StatusCode::NOT_FOUND))),
+    Some(p) => p,
+  };
+}
+
 /// Process unknown requests
 fn process_default(_req: Request<Body>) -> BoxFut {
   Box::new(done(error_response(StatusCode::NOT_FOUND)))
@@ -337,17 +379,16 @@ fn process_default(_req: Request<Body>) -> BoxFut {
 fn process_requests(req: Request<Body>) -> BoxFut {
 //http::Result<Response<Body>> {
 	match *req.method() {
-		//Method::OPTIONS => process_default(req),
+		Method::OPTIONS => process_options(req),
+		Method::HEAD => process_head(req),
 		Method::GET => process_get(req),
-		//Method::HEAD => process_default(req),
-		//Method::POST => process_default(req),
 		Method::PUT => process_put(req),
 		Method::DELETE => process_delete(req),
 		_ => match req.method().as_str() {
 			"MKCOL" => process_mkcol(req),
 			"MOVE" => process_move(req),
 			"COPY" => process_copy(req),
-			//"PROPFIND" => process_default(req),
+			"PROPFIND" => process_propfind(req),
 			//"PROPPATCH" => process_default(req),
 			_ => process_default(req),
 		}
